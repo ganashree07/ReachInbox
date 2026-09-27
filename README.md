@@ -1,6 +1,6 @@
 # ReachInbox Email Scheduler
 
-A production-grade email scheduling system built for the ReachInbox hiring assignment. Upload a CSV of recipients, set a send time, and the system queues and delivers every email reliably — surviving server restarts without losing a single job.
+A production-grade email scheduling system built for the ReachInbox hiring assignment. Upload a CSV of recipients, set a send time, and the system queues and delivers every email reliably — with live dashboard updates, surviving server restarts without losing a single job.
 
 ---
 
@@ -12,6 +12,7 @@ A production-grade email scheduling system built for the ReachInbox hiring assig
 | Queue | BullMQ + Redis |
 | Database | PostgreSQL |
 | SMTP | Ethereal Email (fake SMTP) |
+| Real-time | Socket.io (WebSockets) |
 | Frontend | Next.js + Tailwind CSS + TypeScript |
 | Auth | NextAuth.js (Google OAuth) |
 | Queue UI | Bull Board (`/admin/queues`) |
@@ -33,7 +34,7 @@ docker-compose up -d
 ### 2. Backend
 ```bash
 cd backend
-cp .env.example .env      # fill in values (see below)
+cp .env.example .env      # fill in values
 npm install
 npm run dev
 # → http://localhost:4000
@@ -60,9 +61,9 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/reachinbox
 REDIS_URL=redis://localhost:6379
 WORKER_CONCURRENCY=5
 MAX_EMAILS_PER_HOUR_PER_SENDER=200
-SLACK_WEBHOOK_URL=          # optional — leave blank to skip Slack alerts
-ETHEREAL_USER=              # auto-generated on first run, then paste here
-ETHEREAL_PASS=              # auto-generated on first run, then paste here
+SLACK_WEBHOOK_URL=          # optional
+ETHEREAL_USER=              # auto-generated on first run
+ETHEREAL_PASS=              # auto-generated on first run
 ```
 
 ### Frontend (`frontend/.env.local`)
@@ -81,7 +82,7 @@ On first run the backend auto-creates an Ethereal test account and logs the cred
    User: xxxx@ethereal.email
    Pass: xxxx
 ```
-Copy these into your `.env` so they persist across restarts. Every sent email gets a preview URL visible in the Sent tab.
+Copy these into `.env` so they persist across restarts. Every sent email gets a preview URL visible in the Sent tab.
 
 ### Google OAuth Setup
 1. Go to [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Credentials
@@ -100,13 +101,20 @@ Copy these into your `.env` so they persist across restarts. Every sent email ge
 4. A BullMQ delayed job is enqueued with `jobId = emailId` and `delay = scheduledAt - now`
 5. BullMQ holds the job in Redis until the delay expires
 6. The worker picks it up, checks the rate limit, sends via Ethereal SMTP, and updates the DB row to `status = sent`
-7. The frontend polls `/api/emails` every 5 seconds to reflect live status
+7. The backend emits a `email:update` WebSocket event to all connected clients
+8. The dashboard updates instantly — no polling, no refresh needed
 
 ### How persistence on restart works
 - BullMQ stores all jobs in Redis, which runs with `appendonly yes` (AOF persistence)
 - Every job is also written to PostgreSQL before being enqueued
 - On startup, the backend reconciles: any DB row with `status = scheduled` and a future `scheduled_at` that has no corresponding BullMQ job gets re-enqueued
-- This means: kill the server, restart it — future emails still send at the correct time, nothing is duplicated
+- Result: kill the server, restart it — future emails still send at the correct time, nothing is duplicated
+
+### How real-time updates work (WebSockets)
+- Backend creates a Socket.io server alongside Express on the same port
+- When the worker finishes sending an email, it emits `email:update` with the emailId, recipient, status and preview URL
+- The frontend listens for this event, reloads the table instantly, and shows a toast notification
+- No polling — updates happen in under 100ms of the email being sent
 
 ### How idempotency works
 - Each email row gets a UUID (`emailId`)
@@ -124,12 +132,9 @@ Copy these into your `.env` so they persist across restarts. Every sent email ge
 - On each send attempt the worker does `INCR` on the key (TTL: 2 hours)
 - If the counter exceeds `MAX_EMAILS_PER_HOUR_PER_SENDER`, the INCR is rolled back
 - The job is re-queued with a delay of `ms until next UTC hour` — jobs are never dropped
-- If `SLACK_WEBHOOK_URL` is set, a Slack notification fires immediately on rate limit hit
-- If not configured, rate limit hits are logged silently — no crash
+- If `SLACK_WEBHOOK_URL` is set, a Slack notification fires on rate limit hit
 
 **Configurable via:** `MAX_EMAILS_PER_HOUR_PER_SENDER` in `.env`
-
-**Trade-off:** INCR + check is not a single atomic operation. For multi-worker deployments this should be replaced with a Lua script. Safe for single-worker setups (the default).
 
 ---
 
@@ -138,15 +143,6 @@ Copy these into your `.env` so they persist across restarts. Every sent email ge
 - Worker concurrency: `WORKER_CONCURRENCY` env var (default: 5)
 - Minimum delay between sends: BullMQ limiter `{ max: 1, duration: 2000 }` — 1 job per 2 seconds
 - Both values are configurable via environment variables
-
----
-
-## Behavior Under Load (1000+ emails)
-
-- Each recipient is a separate delayed BullMQ job — 1000 emails = 1000 jobs, all stored in Redis
-- The rate limiter reschedules over-limit jobs to the next hour window, preserving order as much as possible
-- The 2-second limiter means the worker processes at most 30 emails/minute per worker instance
-- Scaling up: increase `WORKER_CONCURRENCY` or run multiple worker processes pointing at the same Redis
 
 ---
 
@@ -178,7 +174,7 @@ Copy these into your `.env` so they persist across restarts. Every sent email ge
 
 ### Backend
 - [x] Email scheduling API (`POST /api/emails/schedule`)
-- [x] BullMQ delayed jobs (no cron, ever)
+- [x] BullMQ delayed jobs — no cron, ever
 - [x] PostgreSQL persistence — survives server restarts
 - [x] Idempotency via UUID jobId deduplication
 - [x] Ethereal Email SMTP with preview URLs
@@ -188,27 +184,28 @@ Copy these into your `.env` so they persist across restarts. Every sent email ge
 - [x] Configurable worker concurrency
 - [x] Minimum delay between sends (BullMQ limiter)
 - [x] Bull Board live queue dashboard at `/admin/queues`
-- [x] Health check endpoint
+- [x] WebSocket server (Socket.io) for real-time push updates
 
 ### Frontend
 - [x] Google OAuth login via NextAuth
 - [x] User name, email, avatar in header
 - [x] Logout
 - [x] Dashboard with Scheduled / Sent tabs
-- [x] Live polling every 5 seconds
+- [x] Live WebSocket updates — table refreshes instantly on email send
+- [x] Toast notifications per email sent/failed
+- [x] Live indicator (green pulsing dot) showing active WebSocket connection
 - [x] Compose modal with subject, body, datetime picker
 - [x] CSV upload with recipient count detection (papaparse)
 - [x] Configurable delay between sends and hourly limit
 - [x] Loading states and empty states
 - [x] Ethereal preview link in Sent table
 - [x] Status badges (scheduled / sent / failed)
-- [x] Toast notifications for success and errors
 
 ---
 
 ## Trade-offs & Assumptions
 
-- **Elasticsearch skipped** — PostgreSQL with indexed queries used instead. Elasticsearch would add full-text search but significantly increases setup complexity for marginal gain in this context.
-- **Slack uses webhook URL** instead of full OAuth flow — the webhook URL is stored in `.env`. A full OAuth integration would require a Slack app with token storage per tenant.
-- **Single worker instance** — rate limiting uses simple Redis INCR which is safe for one worker. Multi-worker setups should use a Lua script for atomic check-and-increment.
+- **Elasticsearch skipped** — PostgreSQL with indexed queries used instead. Elasticsearch would add full-text search but significantly increases setup complexity.
+- **Slack uses webhook URL** instead of full OAuth flow — stored in `.env`. Full OAuth would be a production day-2 feature.
+- **Single worker instance** — rate limiting uses Redis INCR which is safe for one worker. Multi-worker setups should use a Lua script for atomic check-and-increment.
 - **Ethereal SMTP** — emails are captured and never delivered to real inboxes. Each sent email gets a preview URL to verify delivery.

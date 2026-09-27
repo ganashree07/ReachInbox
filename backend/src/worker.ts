@@ -31,16 +31,10 @@ async function processJob(job: Job<JobData>): Promise<void> {
   if (!allowed) {
     const delay = msUntilNextHour();
     console.log(`[worker] Rate limit hit for ${sender}. Re-queuing in ${Math.round(delay/1000)}s`);
-
-    await notifySlack(
-      sender,
-      `Hourly limit of ${MAX_PER_HOUR} reached. Email to ${recipient} rescheduled to next hour.`
-    );
-
-    // Re-queue into next hour — preserve jobId so no duplicates
+    await notifySlack(sender, `Hourly limit of ${MAX_PER_HOUR} reached. Email to ${recipient} rescheduled.`);
     await emailQueue.add('sendEmail', job.data, {
       delay,
-      jobId: `retry-${emailId}-${Date.now()}`, // new jobId so BullMQ accepts it
+      jobId: `retry-${emailId}-${Date.now()}`,
       attempts: 3,
       backoff: { type: 'exponential', delay: 5000 },
     });
@@ -50,13 +44,7 @@ async function processJob(job: Job<JobData>): Promise<void> {
   // --- Send email ---
   try {
     const transporter = await getTransporter();
-    const info = await transporter.sendMail({
-      from: sender,
-      to: recipient,
-      subject,
-      text: body,
-    });
-
+    const info = await transporter.sendMail({ from: sender, to: recipient, subject, text: body });
     const previewUrl = nodemailer.getTestMessageUrl(info) || null;
 
     await pool.query(
@@ -64,14 +52,23 @@ async function processJob(job: Job<JobData>): Promise<void> {
       [previewUrl, emailId]
     );
 
+    // 🔴 Emit real-time event to all connected dashboard clients
+    try {
+      const { io } = await import('./index');
+      io.emit('email:update', { emailId, recipient, status: 'sent', previewUrl });
+    } catch (_) {}
+
     console.log(`[worker] ✅ Sent to ${recipient} — preview: ${previewUrl}`);
   } catch (err) {
-    await pool.query(
-      `UPDATE emails SET status='failed' WHERE id=$1`,
-      [emailId]
-    );
+    await pool.query(`UPDATE emails SET status='failed' WHERE id=$1`, [emailId]);
+
+    try {
+      const { io } = await import('./index');
+      io.emit('email:update', { emailId, recipient, status: 'failed', previewUrl: null });
+    } catch (_) {}
+
     console.error(`[worker] ❌ Failed to send to ${recipient}:`, err);
-    throw err; // let BullMQ handle retries
+    throw err;
   }
 }
 
@@ -79,19 +76,11 @@ export function startWorker() {
   const worker = new Worker<JobData>('emailQueue', processJob, {
     connection: redis,
     concurrency: CONCURRENCY,
-    limiter: {
-      max: 1,
-      duration: 2000, // min 2s between sends
-    },
+    limiter: { max: 1, duration: 2000 },
   });
 
-  worker.on('completed', (job) => {
-    console.log(`[worker] Job ${job.id} completed`);
-  });
-
-  worker.on('failed', (job, err) => {
-    console.error(`[worker] Job ${job?.id} failed:`, err.message);
-  });
+  worker.on('completed', (job) => console.log(`[worker] Job ${job.id} completed`));
+  worker.on('failed', (job, err) => console.error(`[worker] Job ${job?.id} failed:`, err.message));
 
   console.log(`✅ Worker started — concurrency: ${CONCURRENCY}, limiter: 1 per 2s`);
   return worker;
